@@ -1,0 +1,5 @@
+streamlit>=1.31.0
+openai>=1.12.0
+python-dotenv>=1.0.0
+openpyxl>=3.1.2
+pdfplumber>=0.10.3
