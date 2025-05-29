@@ -3,3 +3,7 @@ openai>=1.12.0
 python-dotenv>=1.0.0
 openpyxl>=3.1.2
 pdfplumber>=0.10.3
+pytesseract>=0.3.10
+pdf2image>=1.16.3
+Pillow>=10.0.0
+opencv-python>=4.9.0

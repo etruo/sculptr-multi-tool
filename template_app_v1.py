@@ -18,13 +18,13 @@ if "history" not in st.session_state:
 
 # Page configuration
 st.set_page_config(
-    page_title="🏢 Motherfucking (MF) Underwriting Helper",
+    page_title="🏢 Multifamily Underwriting Helper",
     page_icon="🏢",
     layout="centered",
     initial_sidebar_state="expanded"
 )
 
-st.title("🏢  Value-Add Multifamily Parser + Model Filler")
+st.title("🏢 Multifamily Underwriting Helper")
 
 # ---------- sidebar: API key, settings & history ------------------------------------------------
 with st.sidebar:

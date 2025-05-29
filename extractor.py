@@ -4,6 +4,8 @@ LLM‑powered text / PDF parser for **value‑add multifamily** OMs & deal
 emails.  Produces a clean JSON dict that can be fed into the underwriting
 model (see build_model.py).
 
+Now with OCR support for image-based PDFs.
+
 ---------------------------------------------------------------------
 Returned JSON schema
 ====================
@@ -46,12 +48,18 @@ import json
 import os
 import re
 import textwrap
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Dict, Union, List
 
 import pdfplumber
+from pdf2image import convert_from_path
+import pytesseract
+from PIL import Image, ImageEnhance
 from dotenv import load_dotenv
 from openai import OpenAI
+import cv2
+import numpy as np
 
 # ------------------------------------------------------------------
 # Configuration
@@ -135,20 +143,189 @@ SCHEMA_EXAMPLE = textwrap.dedent(
 # Helpers
 # ------------------------------------------------------------------
 
-def _extract_text_from_pdf(pdf_path: Union[str, Path]) -> str:
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+def _preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
+    """Apply advanced image preprocessing for better OCR results."""
+    # Convert PIL Image to cv2 format
+    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    
+    # Apply adaptive thresholding
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    
+    # Denoise
+    denoised = cv2.fastNlMeansDenoising(thresh)
+    
+    # Convert back to PIL
+    enhanced_img = Image.fromarray(denoised)
+    
+    # Enhance contrast
+    enhancer = ImageEnhance.Contrast(enhanced_img)
+    enhanced_img = enhancer.enhance(2.0)
+    
+    # Increase resolution
+    width, height = enhanced_img.size
+    scale_factor = 2
+    enhanced_img = enhanced_img.resize(
+        (width * scale_factor, height * scale_factor),
+        Image.Resampling.LANCZOS
+    )
+    
+    return enhanced_img
 
+def _extract_text_from_image(image: Image) -> str:
+    """Extract text from an image using OCR with enhanced preprocessing."""
+    try:
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Apply preprocessing
+        processed_image = _preprocess_image_for_ocr(image)
+        
+        # OCR Configuration
+        custom_config = r'''--oem 3 
+            --psm 6 
+            -c preserve_interword_spaces=1
+            -c tessedit_char_whitelist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,/$%- "
+            -c tessedit_pageseg_mode=6
+            -c textord_heavy_nr=1
+            -c textord_min_linesize=2.5
+        '''
+        
+        # Extract text with detailed configuration
+        text = pytesseract.image_to_string(
+            processed_image,
+            config=custom_config,
+            lang='eng'
+        )
+        
+        if os.environ.get("DEBUG"):
+            print(f"OCR extracted text length: {len(text)}")
+            print("Sample of extracted text:", text[:200])
+            # Save debug images
+            debug_dir = "debug_ocr"
+            os.makedirs(debug_dir, exist_ok=True)
+            processed_image.save(f"{debug_dir}/processed_page.png")
+            
+        return text
+    except Exception as e:
+        print(f"OCR error: {e}")
+        return ""
+
+def _extract_text_from_pdf(pdf_path: Union[str, Path]) -> str:
+    """Extract text from PDF using both pdfplumber and OCR if needed."""
+    text_content = []
+    debug = os.environ.get("DEBUG", False)
+    
+    # First try pdfplumber for native text extraction
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            text = page.extract_text() or ""
+            if debug:
+                print(f"Page {page_num} native text extraction length: {len(text)}")
+            text_content.append(text)
+    
+    # If we got very little text, try OCR
+    if not any(text_content) or sum(len(t) for t in text_content) < 100:
+        if debug:
+            print("Limited text extracted, attempting OCR...")
+        
+        try:
+            # Convert PDF to images with higher DPI for better quality
+            images = convert_from_path(
+                pdf_path,
+                dpi=400,  # Increased DPI
+                fmt='png',  # Using PNG for better quality
+                grayscale=True,  # Convert to grayscale
+                thread_count=4,
+                use_cropbox=True,  # Use cropbox for better region detection
+                first_page=1,
+                last_page=None
+            )
+            
+            if debug:
+                print(f"Converting {len(images)} pages to images for OCR")
+            
+            # Process each page with OCR
+            text_content = []
+            for idx, image in enumerate(images, 1):
+                if debug:
+                    print(f"Processing page {idx} with OCR...")
+                text = _extract_text_from_image(image)
+                if text.strip():  # Only add non-empty text
+                    text_content.append(text)
+                
+        except Exception as e:
+            print(f"OCR processing error: {e}")
+    
+    combined_text = "\n".join(text_content)
+    
+    if debug:
+        print(f"Total extracted text length: {len(combined_text)}")
+        print("\nSample of final text:")
+        print(combined_text[:500])
+        
+        # Save debug output
+        debug_dir = "debug_ocr"
+        os.makedirs(debug_dir, exist_ok=True)
+        with open(f"{debug_dir}/extracted_text.txt", "w") as f:
+            f.write(combined_text)
+    
+    return combined_text
+
+def _clean_text(text: str) -> str:
+    """Clean and normalize extracted text with enhanced processing."""
+    # Convert to lowercase for consistent processing
+    text = text.lower()
+    
+    # Replace common OCR mistakes
+    replacements = {
+        'l/l': '1/1',  # Common OCR mistake for unit types
+        'l/2': '1/2',
+        '2/l': '2/1',
+        'sq,ft': 'sq ft',
+        'sq.ft': 'sq ft',
+        'sqft': 'sq ft',
+    }
+    
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Keep more special characters that might be relevant
+    text = re.sub(r'[^\w\s.,;:$%()/-]', '', text)
+    
+    # Normalize unit types
+    text = re.sub(r'(\d)\s*/\s*(\d)', r'\1/\2', text)
+    
+    # Normalize currency
+    text = re.sub(r'\$\s*(\d)', r'$\1', text)
+    
+    # Normalize percentages
+    text = re.sub(r'(\d)\s*%', r'\1%', text)
+    
+    return text.strip()
 
 def _call_llm(raw_text: str) -> Dict[str, Any]:
-    """Hit the ChatCompletion endpoint and parse JSON output."""
+    """Hit the ChatCompletion endpoint with enhanced prompt."""
+    # Clean the text before sending to OpenAI
+    cleaned_text = _clean_text(raw_text)
+    
+    # Enhanced prompt with more context
     user_prompt = (
         f"{SCHEMA_EXAMPLE}\n\n"
-        "Below is the offering memorandum or email body.\n"
+        "Below is the offering memorandum text extracted via OCR. "
+        "Note that some numbers might need to be interpreted from context. "
+        "Look for both numeric and written forms of numbers. "
         "---\n"
-        f"{raw_text}\n"
+        f"{cleaned_text}\n"
         "---\n\n"
-        "Extract the JSON as per the schema.  JSON only."
+        "Extract the JSON as per the schema. For any fields where you're not completely "
+        "confident about the value, use null rather than guessing. JSON only."
     )
 
     resp = client.chat.completions.create(
@@ -182,6 +359,9 @@ def parse_deal(
         raise ValueError("Provide only one input.")
 
     text = plain_text if plain_text else _extract_text_from_pdf(pdf_path)  # type: ignore[arg-type]
+    
+    if not text.strip():
+        raise ValueError("No text could be extracted from the document")
 
     data = _call_llm(text)
 
@@ -200,6 +380,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Extract multifamily OM data → JSON")
     p.add_argument("source", help="Path to PDF OM or .txt email file")
     p.add_argument("--out", "-o", help="Save extracted JSON here for review")
+    p.add_argument("--debug", action="store_true", help="Show debug information")
     args = p.parse_args()
 
     src = Path(args.source)
